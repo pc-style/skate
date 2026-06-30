@@ -6,23 +6,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
 const (
-	sessionVersion    = 1
+	sessionVersion    = 2
 	defaultSessionTTL = 12 * time.Hour
 )
 
 type sessionFile struct {
-	Version   int       `json:"version"`
-	DB        string    `json:"db"`
-	DataKey   string    `json:"data_key"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Version    int       `json:"version"`
+	DB         string    `json:"db"`
+	EnvelopeFP string    `json:"envelope_fp"`
+	DataKey    string    `json:"data_key"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
-func saveSession(dbName string, dataKey []byte, ttl time.Duration) error {
+func saveSession(dbName, envelopeFP string, dataKey []byte, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = defaultSessionTTL
 	}
@@ -31,23 +31,35 @@ func saveSession(dbName string, dataKey []byte, ttl time.Duration) error {
 		return fmt.Errorf("create session dir: %w", err)
 	}
 	session := sessionFile{
-		Version:   sessionVersion,
-		DB:        dbName,
-		DataKey:   base64.StdEncoding.EncodeToString(dataKey),
-		ExpiresAt: time.Now().Add(ttl),
+		Version:    sessionVersion,
+		DB:         dbName,
+		EnvelopeFP: envelopeFP,
+		DataKey:    base64.StdEncoding.EncodeToString(dataKey),
+		ExpiresAt:  time.Now().Add(ttl),
 	}
 	bts, err := json.Marshal(session)
 	if err != nil {
 		return fmt.Errorf("marshal session: %w", err)
 	}
 	path := sessionPath(dir, dbName)
-	if err := os.WriteFile(path, bts, 0o600); err != nil {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open session: %w", err)
+	}
+	if _, err := f.Write(bts); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write session: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close session: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("chmod session: %w", err)
 	}
 	return nil
 }
 
-func loadSession(dbName string) ([]byte, error) {
+func loadSession(dbName, envelopeFP string) ([]byte, error) {
 	dir := getSessionDir()
 	bts, err := os.ReadFile(sessionPath(dir, dbName))
 	if os.IsNotExist(err) {
@@ -60,7 +72,7 @@ func loadSession(dbName string) ([]byte, error) {
 	if err := json.Unmarshal(bts, &session); err != nil {
 		return nil, fmt.Errorf("parse session: %w", err)
 	}
-	if session.Version != sessionVersion || session.DB != dbName {
+	if session.Version != sessionVersion || session.DB != dbName || session.EnvelopeFP != envelopeFP {
 		return nil, fmt.Errorf("session for @%s is invalid; run `skate unlock @%s --passphrase-stdin`", dbName, dbName)
 	}
 	if time.Now().After(session.ExpiresAt) {
@@ -85,9 +97,8 @@ func removeSession(dbName string) error {
 	return nil
 }
 
-func sessionStatus(dbName string) string {
-	_, err := loadSession(dbName)
-	if err == nil {
+func sessionStatus(dbName, envelopeFP string) string {
+	if _, err := loadSession(dbName, envelopeFP); err == nil {
 		return "unlocked"
 	}
 	return "locked"
@@ -104,6 +115,6 @@ func getSessionDir() string {
 }
 
 func sessionPath(dir, dbName string) string {
-	name := strings.NewReplacer("/", "_", "\\", "_", ":", "_", string(filepath.Separator), "_").Replace(dbName)
+	name := base64.RawURLEncoding.EncodeToString([]byte(dbName))
 	return filepath.Join(dir, name+".json")
 }

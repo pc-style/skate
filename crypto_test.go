@@ -22,14 +22,15 @@ func TestEncryptValueRoundTrip(t *testing.T) {
 	if !bytes.Equal(dataKey, unlocked) {
 		t.Fatal("unlocked data key did not match generated key")
 	}
-	encrypted, err := encryptValue(dataKey, []byte("agent secret"))
+	itemKey := []byte("token")
+	encrypted, err := encryptValue(dataKey, itemKey, []byte("agent secret"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(encrypted, []byte("agent secret")) {
 		t.Fatal("ciphertext contains plaintext")
 	}
-	plaintext, err := decryptValue(unlocked, encrypted)
+	plaintext, err := decryptValue(unlocked, itemKey, encrypted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,11 +52,11 @@ func TestUnlockDataKeyRejectsWrongPassphrase(t *testing.T) {
 func TestSessionExpires(t *testing.T) {
 	t.Setenv("SKATE_SESSION_DIR", t.TempDir())
 	dataKey := bytes.Repeat([]byte{7}, dataKeySize)
-	if err := saveSession("agent", dataKey, time.Nanosecond); err != nil {
+	if err := saveSession("agent", "fp", dataKey, time.Nanosecond); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(time.Millisecond)
-	if _, err := loadSession("agent"); err == nil {
+	if _, err := loadSession("agent", "fp"); err == nil {
 		t.Fatal("expired session loaded successfully")
 	}
 }
@@ -73,24 +74,24 @@ func TestEncryptDBMigratesPlaintextValues(t *testing.T) {
 		dryRun = false
 		sessionTTL = defaultSessionTTL
 	})
-	db, err := openKV("legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := wrap(db, false, func(tx *badger.Txn) error {
-		return tx.Set([]byte("token"), []byte("old-secret"))
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	func() {
+		db, err := openKV("legacy")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close() //nolint:errcheck
+		if err := wrap(db, false, func(tx *badger.Txn) error {
+			return tx.Set([]byte("token"), []byte("old-secret"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	cmd := &cobra.Command{}
 	cmd.SetIn(strings.NewReader("migration-passphrase\n"))
 	if err := encryptDB(cmd, []string{"@legacy"}); err != nil {
 		t.Fatal(err)
 	}
-	db, err = openKV("legacy")
+	db, err := openKV("legacy")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +114,7 @@ func TestEncryptDBMigratesPlaintextValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, err := decryptValue(dataKey, stored)
+	plaintext, err := decryptValue(dataKey, []byte("token"), stored)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -99,7 +99,7 @@ var (
 		Short:   "Delete a database",
 		Aliases: []string{"del-db", "rm-db"},
 		Example: "  skate delete-db @agent --dry-run\n  skate delete-db @agent --yes",
-		Args:    cobra.MinimumNArgs(1),
+		Args:    cobra.ExactArgs(1),
 		RunE:    deleteDb,
 	}
 
@@ -164,7 +164,7 @@ func set(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if len(args) == 2 {
-		encrypted, err := encryptValue(dataKey, []byte(args[1]))
+		encrypted, err := encryptValue(dataKey, k, []byte(args[1]))
 		if err != nil {
 			return err
 		}
@@ -176,7 +176,7 @@ func set(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	encrypted, err := encryptValue(dataKey, bts)
+	encrypted, err := encryptValue(dataKey, k, bts)
 	if err != nil {
 		return err
 	}
@@ -212,7 +212,7 @@ func get(cmd *cobra.Command, args []string) error {
 	}); err != nil {
 		return err
 	}
-	plaintext, err := decryptValue(dataKey, v)
+	plaintext, err := decryptValue(dataKey, k, v)
 	if err != nil {
 		return err
 	}
@@ -292,6 +292,18 @@ func unlock(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if !ok {
+		if !initEncryptedDB {
+			return fmt.Errorf("database @%s is not encrypted; run `skate unlock @%s --init --passphrase-stdin` to initialize it", n, n)
+		}
+		values, err := plaintextValues(db)
+		if err != nil {
+			return err
+		}
+		if len(values) > 0 {
+			return fmt.Errorf("database @%s has existing plaintext keys; run `skate encrypt @%s --passphrase-stdin` instead", n, n)
+		}
+	}
 	passphrase, err := passphraseFromCommand(cmd)
 	if err != nil {
 		return err
@@ -304,30 +316,27 @@ func unlock(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	} else {
-		if !initEncryptedDB {
-			return fmt.Errorf("database @%s is not encrypted; run `skate unlock @%s --init --passphrase-stdin` to initialize it", n, n)
-		}
-		dataKey, err = initializeEncryptedDB(db, passphrase)
+		envelope, dataKey, err = initializeEncryptedDB(db, passphrase)
 		if err != nil {
 			return err
 		}
 		initialized = true
 	}
-	if err := saveSession(n, dataKey, sessionTTL); err != nil {
+	if err := saveSession(n, envelopeFingerprint(envelope), dataKey, sessionTTL); err != nil {
 		return err
 	}
 	fmt.Printf("unlocked @%s\ninitialized: %t\nsession_ttl: %s\n", n, initialized, effectiveSessionTTL(sessionTTL))
 	return nil
 }
 
-func initializeEncryptedDB(db *badger.DB, passphrase string) ([]byte, error) {
+func initializeEncryptedDB(db *badger.DB, passphrase string) (keyEnvelope, []byte, error) {
 	envelope, dataKey, err := newKeyEnvelope(passphrase)
 	if err != nil {
-		return nil, err
+		return keyEnvelope{}, nil, err
 	}
 	envelopeBts, err := marshalEnvelope(envelope)
 	if err != nil {
-		return nil, err
+		return keyEnvelope{}, nil, err
 	}
 	if err := wrap(db, false, func(tx *badger.Txn) error {
 		if err := tx.Set([]byte(envelopeKey), envelopeBts); err != nil {
@@ -335,9 +344,9 @@ func initializeEncryptedDB(db *badger.DB, passphrase string) ([]byte, error) {
 		}
 		return nil
 	}); err != nil {
-		return nil, err
+		return keyEnvelope{}, nil, err
 	}
-	return dataKey, nil
+	return envelope, dataKey, nil
 }
 
 func lock(_ *cobra.Command, args []string) error {
@@ -362,11 +371,15 @@ func status(_ *cobra.Command, args []string) error {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
-	_, encrypted, err := readEnvelope(db)
+	envelope, encrypted, err := readEnvelope(db)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("database: @%s\nencrypted: %t\nsession: %s\n", n, encrypted, sessionStatus(n))
+	fp := ""
+	if encrypted {
+		fp = envelopeFingerprint(envelope)
+	}
+	fmt.Printf("database: @%s\nencrypted: %t\nsession: %s\n", n, encrypted, sessionStatus(n, fp))
 	return nil
 }
 
@@ -411,7 +424,7 @@ func encryptDB(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("write key envelope: %w", err)
 		}
 		for key, value := range values {
-			encrypted, err := encryptValue(dataKey, value)
+			encrypted, err := encryptValue(dataKey, []byte(key), value)
 			if err != nil {
 				return err
 			}
@@ -423,7 +436,7 @@ func encryptDB(cmd *cobra.Command, args []string) error {
 	}); err != nil {
 		return err
 	}
-	if err := saveSession(n, dataKey, sessionTTL); err != nil {
+	if err := saveSession(n, envelopeFingerprint(envelope), dataKey, sessionTTL); err != nil {
 		return err
 	}
 	fmt.Printf("encrypted @%s\nkeys_encrypted: %d\nsession_ttl: %s\n", n, len(values), effectiveSessionTTL(sessionTTL))
@@ -479,10 +492,9 @@ func deleteDb(_ *cobra.Command, args []string) error {
 		return nil
 	}
 	if assumeYes {
-		if err := os.RemoveAll(path); err != nil {
+		if err := finishDeleteDb(path, showpath, args[0]); err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "Deleted %q\n", showpath)
 		return nil
 	}
 	fmt.Println(message)
@@ -492,13 +504,23 @@ func deleteDb(_ *cobra.Command, args []string) error {
 		return err
 	}
 	if confirmation == "y" {
-		if err := os.RemoveAll(path); err != nil {
+		if err := finishDeleteDb(path, showpath, args[0]); err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "Deleted %q\n", showpath)
 		return nil
 	}
 	fmt.Fprintf(os.Stderr, "Did not delete %q\n", showpath)
+	return nil
+}
+
+func finishDeleteDb(path, showpath, dbArg string) error {
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("delete database: %w", err)
+	}
+	if n, err := dbNameFromOptionalArg([]string{dbArg}); err == nil {
+		_ = removeSession(n)
+	}
+	fmt.Fprintf(os.Stderr, "Deleted %q\n", showpath)
 	return nil
 }
 
@@ -587,7 +609,7 @@ func list(cmd *cobra.Command, args []string) error {
 				continue
 			}
 			err := item.Value(func(v []byte) error {
-				plaintext, err := decryptValue(dataKey, v)
+				plaintext, err := decryptValue(dataKey, k, v)
 				if err != nil {
 					return err
 				}
@@ -640,13 +662,17 @@ func dataKeyForDB(_ *cobra.Command, db *badger.DB, dbName string) ([]byte, error
 	if !ok {
 		return nil, fmt.Errorf("database @%s is not encrypted; run `skate unlock @%s --init --passphrase-stdin` for a new database or `skate encrypt @%s --passphrase-stdin` for an existing plaintext database", dbName, dbName, dbName)
 	}
-	dataKey, err := loadSession(dbName)
+	fp := envelopeFingerprint(envelope)
+	dataKey, err := loadSession(dbName, fp)
 	if err == nil {
 		return dataKey, nil
 	}
-	passphrase := os.Getenv("SKATE_PASSPHRASE")
-	if passphrase == "" && passphraseEnv != "" {
+	var passphrase string
+	if passphraseEnv != "" {
 		passphrase = os.Getenv(passphraseEnv)
+	}
+	if passphrase == "" {
+		passphrase = os.Getenv("SKATE_PASSPHRASE")
 	}
 	if passphrase == "" {
 		return nil, err
@@ -655,7 +681,7 @@ func dataKeyForDB(_ *cobra.Command, db *badger.DB, dbName string) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	if err := saveSession(dbName, dataKey, sessionTTL); err != nil {
+	if err := saveSession(dbName, fp, dataKey, sessionTTL); err != nil {
 		return nil, err
 	}
 	return dataKey, nil
@@ -766,7 +792,7 @@ func effectiveSessionTTL(ttl time.Duration) time.Duration {
 func printFromKV(pf string, vs ...[]byte) {
 	nb := "(omitted binary data)"
 	fvs := make([]any, 0)
-	isatty := term.IsTerminal(int(os.Stdin.Fd()))
+	isatty := term.IsTerminal(int(os.Stdout.Fd()))
 	for _, v := range vs {
 		if isatty && !showBinary && !utf8.Valid(v) {
 			fvs = append(fvs, nb)

@@ -17,7 +17,7 @@ import (
 const (
 	envelopeKey   = "\x00skate/envelope"
 	valueMagic    = "skate:v1:"
-	kdfIterations = 310000
+	kdfIterations = 600000
 	dataKeySize   = 32
 	nonceSize     = 12
 )
@@ -95,6 +95,9 @@ func unlockDataKey(envelope keyEnvelope, passphrase string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode envelope nonce: %w", err)
 	}
+	if len(nonce) != nonceSize {
+		return nil, fmt.Errorf("decode envelope nonce: invalid length")
+	}
 	ciphertext, err := base64.StdEncoding.DecodeString(envelope.EncryptedKey)
 	if err != nil {
 		return nil, fmt.Errorf("decode encrypted data key: %w", err)
@@ -113,12 +116,17 @@ func unlockDataKey(envelope keyEnvelope, passphrase string) ([]byte, error) {
 	return dataKey, nil
 }
 
-func encryptValue(dataKey, value []byte) ([]byte, error) {
+func envelopeFingerprint(envelope keyEnvelope) string {
+	sum := sha256.Sum256([]byte(envelope.EncryptedKey))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func encryptValue(dataKey, itemKey, value []byte) ([]byte, error) {
 	nonce := make([]byte, nonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("generate value nonce: %w", err)
 	}
-	ciphertext, err := seal(dataKey, nonce, value, nil)
+	ciphertext, err := seal(dataKey, nonce, value, itemKey)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +137,7 @@ func encryptValue(dataKey, value []byte) ([]byte, error) {
 	return out, nil
 }
 
-func decryptValue(dataKey, value []byte) ([]byte, error) {
+func decryptValue(dataKey, itemKey, value []byte) ([]byte, error) {
 	if !bytes.HasPrefix(value, []byte(valueMagic)) {
 		return nil, errEncryptedValueFormat
 	}
@@ -137,7 +145,7 @@ func decryptValue(dataKey, value []byte) ([]byte, error) {
 	if len(payload) < nonceSize {
 		return nil, errEncryptedValueFormat
 	}
-	plaintext, err := open(dataKey, payload[:nonceSize], payload[nonceSize:], nil)
+	plaintext, err := open(dataKey, payload[:nonceSize], payload[nonceSize:], itemKey)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt value: %w", err)
 	}
