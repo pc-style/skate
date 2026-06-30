@@ -640,11 +640,20 @@ func nameFromArgs(args []string) (string, error) {
 }
 
 func dbNameFromOptionalArg(args []string) (string, error) {
+	if len(args) == 0 {
+		return normalizeDBName(""), nil
+	}
+	if !strings.HasPrefix(args[0], "@") {
+		return "", fmt.Errorf("database argument must use @NAME syntax, e.g. `skate unlock @agent`")
+	}
 	n, err := nameFromArgs(args)
 	if err != nil {
 		return "", err
 	}
-	return normalizeDBName(n), nil
+	if n == "" {
+		return "", fmt.Errorf("database argument must use @NAME syntax, e.g. `skate unlock @agent`")
+	}
+	return n, nil
 }
 
 func normalizeDBName(name string) string {
@@ -670,9 +679,11 @@ func dataKeyForDB(_ *cobra.Command, db *badger.DB, dbName string) ([]byte, error
 	var passphrase string
 	if passphraseEnv != "" {
 		passphrase = os.Getenv(passphraseEnv)
-	}
-	if passphrase == "" {
-		passphrase = os.Getenv("SKATE_PASSPHRASE")
+		if passphrase == "" {
+			return nil, fmt.Errorf("environment variable %s is empty; set it or omit --passphrase-env", passphraseEnv)
+		}
+	} else if envPass := os.Getenv("SKATE_PASSPHRASE"); envPass != "" {
+		passphrase = envPass
 	}
 	if passphrase == "" {
 		return nil, err

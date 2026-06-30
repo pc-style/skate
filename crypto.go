@@ -117,7 +117,12 @@ func unlockDataKey(envelope keyEnvelope, passphrase string) ([]byte, error) {
 }
 
 func envelopeFingerprint(envelope keyEnvelope) string {
-	sum := sha256.Sum256([]byte(envelope.EncryptedKey))
+	bts, err := json.Marshal(envelope)
+	if err != nil {
+		sum := sha256.Sum256([]byte(envelope.EncryptedKey))
+		return base64.StdEncoding.EncodeToString(sum[:])
+	}
+	sum := sha256.Sum256(bts)
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 

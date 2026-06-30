@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -50,12 +52,22 @@ func TestUnlockDataKeyRejectsWrongPassphrase(t *testing.T) {
 }
 
 func TestSessionExpires(t *testing.T) {
-	t.Setenv("SKATE_SESSION_DIR", t.TempDir())
-	dataKey := bytes.Repeat([]byte{7}, dataKeySize)
-	if err := saveSession("agent", "fp", dataKey, time.Nanosecond); err != nil {
+	dir := t.TempDir()
+	t.Setenv("SKATE_SESSION_DIR", dir)
+	session := sessionFile{
+		Version:    sessionVersion,
+		DB:         "agent",
+		EnvelopeFP: "fp",
+		DataKey:    "AAAA",
+		ExpiresAt:  time.Now().Add(-time.Hour),
+	}
+	bts, err := json.Marshal(session)
+	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(time.Millisecond)
+	if err := os.WriteFile(sessionPath(dir, "agent"), bts, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := loadSession("agent", "fp"); err == nil {
 		t.Fatal("expired session loaded successfully")
 	}
@@ -79,7 +91,11 @@ func TestEncryptDBMigratesPlaintextValues(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer db.Close() //nolint:errcheck
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 		if err := wrap(db, false, func(tx *badger.Txn) error {
 			return tx.Set([]byte("token"), []byte("old-secret"))
 		}); err != nil {
@@ -95,7 +111,11 @@ func TestEncryptDBMigratesPlaintextValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close() //nolint:errcheck
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	var stored []byte
 	if err := wrap(db, true, func(tx *badger.Txn) error {
 		item, err := tx.Get([]byte("token"))
