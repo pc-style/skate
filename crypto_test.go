@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"strings"
@@ -54,11 +55,12 @@ func TestUnlockDataKeyRejectsWrongPassphrase(t *testing.T) {
 func TestSessionExpires(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SKATE_SESSION_DIR", dir)
+	dataKey := bytes.Repeat([]byte{7}, dataKeySize)
 	session := sessionFile{
 		Version:    sessionVersion,
 		DB:         "agent",
 		EnvelopeFP: "fp",
-		DataKey:    "AAAA",
+		DataKey:    base64.StdEncoding.EncodeToString(dataKey),
 		ExpiresAt:  time.Now().Add(-time.Hour),
 	}
 	bts, err := json.Marshal(session)
