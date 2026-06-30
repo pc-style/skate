@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/agnivade/levenshtein"
@@ -28,13 +29,20 @@ var (
 	valuesIterate    bool
 	showBinary       bool
 	delimiterIterate string
+	passphraseEnv    string
+	passphraseStdin  bool
+	initEncryptedDB  bool
+	sessionTTL       time.Duration
+	assumeYes        bool
+	dryRun           bool
 
 	warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true)
 
 	rootCmd = &cobra.Command{
-		Use:   "skate",
-		Short: "Skate, a personal key value store.",
-		Args:  cobra.NoArgs,
+		Use:     "skate",
+		Short:   "Skate, an encrypted personal key value store.",
+		Example: "  skate unlock @agent --init --passphrase-stdin\n  skate set token@agent \"$TOKEN\"\n  skate get token@agent\n  skate lock @agent",
+		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return cmd.Help()
 		},
@@ -43,7 +51,7 @@ var (
 	setCmd = &cobra.Command{
 		Use:     "set KEY[@DB] [VALUE]",
 		Short:   "Set a value for a key with an optional @ db. If VALUE is omitted, read value from the standard input.",
-		Example: "  skate set foo bar\n  skate set foo <./bar.txt",
+		Example: "  skate set foo@agent bar\n  skate set foo@agent <./bar.txt",
 		Args:    cobra.RangeArgs(1, 2),
 		RunE:    set,
 	}
@@ -53,6 +61,7 @@ var (
 		Short:         "Get a value for a key with an optional @ db.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Example:       "  skate get foo@agent\n  skate get profile-pic@agent > profile-pic.jpg",
 		Args:          cobra.ExactArgs(1),
 		RunE:          get,
 	}
@@ -61,6 +70,7 @@ var (
 		Use:     "delete KEY[@DB]",
 		Short:   "Delete a key with an optional @ db.",
 		Aliases: []string{"del", "rm"},
+		Example: "  skate delete foo@agent",
 		Args:    cobra.ExactArgs(1),
 		RunE:    del,
 	}
@@ -69,6 +79,7 @@ var (
 		Use:     "list [@DB]",
 		Short:   "List key value pairs with an optional @ db.",
 		Aliases: []string{"ls"},
+		Example: "  skate list @agent\n  skate list @agent --keys-only\n  skate list @agent --delimiter \"=\"",
 		Args:    cobra.MaximumNArgs(1),
 		RunE:    list,
 	}
@@ -77,6 +88,7 @@ var (
 		Use:     "list-dbs",
 		Short:   "List databases.",
 		Aliases: []string{"ls-db"},
+		Example: "  skate list-dbs",
 		Args:    cobra.NoArgs,
 		RunE:    listDbs,
 	}
@@ -86,8 +98,41 @@ var (
 		Hidden:  false,
 		Short:   "Delete a database",
 		Aliases: []string{"del-db", "rm-db"},
+		Example: "  skate delete-db @agent --dry-run\n  skate delete-db @agent --yes",
 		Args:    cobra.MinimumNArgs(1),
 		RunE:    deleteDb,
+	}
+
+	unlockCmd = &cobra.Command{
+		Use:     "unlock [@DB]",
+		Short:   "Unlock an encrypted database for this OS session.",
+		Example: "  printf '%s\\n' \"$SKATE_AGENT_PASSPHRASE\" | skate unlock @agent --init --passphrase-stdin\n  skate unlock @agent --passphrase-env SKATE_AGENT_PASSPHRASE\n  skate unlock @agent --session-ttl 8h",
+		Args:    cobra.MaximumNArgs(1),
+		RunE:    unlock,
+	}
+
+	lockCmd = &cobra.Command{
+		Use:     "lock [@DB]",
+		Short:   "Remove this session's unlock token for a database.",
+		Example: "  skate lock @agent",
+		Args:    cobra.MaximumNArgs(1),
+		RunE:    lock,
+	}
+
+	statusCmd = &cobra.Command{
+		Use:     "status [@DB]",
+		Short:   "Show whether a database is encrypted and unlocked.",
+		Example: "  skate status @agent",
+		Args:    cobra.MaximumNArgs(1),
+		RunE:    status,
+	}
+
+	encryptCmd = &cobra.Command{
+		Use:     "encrypt [@DB]",
+		Short:   "Encrypt an existing plaintext database.",
+		Example: "  skate encrypt @default --dry-run\n  printf '%s\\n' \"$SKATE_AGENT_PASSPHRASE\" | skate encrypt @default --passphrase-stdin",
+		Args:    cobra.MaximumNArgs(1),
+		RunE:    encryptDB,
 	}
 )
 
@@ -108,36 +153,54 @@ func set(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	n = normalizeDBName(n)
 	db, err := openKV(n)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
+	dataKey, err := dataKeyForDB(cmd, db, n)
+	if err != nil {
+		return err
+	}
 	if len(args) == 2 {
+		encrypted, err := encryptValue(dataKey, []byte(args[1]))
+		if err != nil {
+			return err
+		}
 		return wrap(db, false, func(tx *badger.Txn) error {
-			return tx.Set(k, []byte(args[1]))
+			return tx.Set(k, encrypted)
 		})
 	}
 	bts, err := io.ReadAll(cmd.InOrStdin())
 	if err != nil {
 		return err
 	}
+	encrypted, err := encryptValue(dataKey, bts)
+	if err != nil {
+		return err
+	}
 	return wrap(db, false, func(tx *badger.Txn) error {
-		return tx.Set(k, bts)
+		return tx.Set(k, encrypted)
 	})
 }
 
 //nolint:wrapcheck
-func get(_ *cobra.Command, args []string) error {
+func get(cmd *cobra.Command, args []string) error {
 	k, n, err := keyParser(args[0])
 	if err != nil {
 		return err
 	}
+	n = normalizeDBName(n)
 	db, err := openKV(n)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
+	dataKey, err := dataKeyForDB(cmd, db, n)
+	if err != nil {
+		return err
+	}
 	var v []byte
 	if err := wrap(db, true, func(tx *badger.Txn) error {
 		item, err := tx.Get(k)
@@ -149,20 +212,28 @@ func get(_ *cobra.Command, args []string) error {
 	}); err != nil {
 		return err
 	}
-	printFromKV("%s", v)
+	plaintext, err := decryptValue(dataKey, v)
+	if err != nil {
+		return err
+	}
+	printFromKV("%s", plaintext)
 	return nil
 }
 
-func del(_ *cobra.Command, args []string) error {
+func del(cmd *cobra.Command, args []string) error {
 	k, n, err := keyParser(args[0])
 	if err != nil {
 		return err
 	}
+	n = normalizeDBName(n)
 	db, err := openKV(n)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
+	if _, err := dataKeyForDB(cmd, db, n); err != nil {
+		return err
+	}
 
 	return wrap(db, false, func(tx *badger.Txn) error {
 		return tx.Delete(k)
@@ -207,20 +278,177 @@ func formatDbs(dbs []string) []string {
 	return out
 }
 
+func unlock(cmd *cobra.Command, args []string) error {
+	n, err := dbNameFromOptionalArg(args)
+	if err != nil {
+		return err
+	}
+	db, err := openKV(n)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+	envelope, ok, err := readEnvelope(db)
+	if err != nil {
+		return err
+	}
+	passphrase, err := passphraseFromCommand(cmd)
+	if err != nil {
+		return err
+	}
+	var dataKey []byte
+	initialized := false
+	if ok {
+		dataKey, err = unlockDataKey(envelope, passphrase)
+		if err != nil {
+			return err
+		}
+	} else {
+		if !initEncryptedDB {
+			return fmt.Errorf("database @%s is not encrypted; run `skate unlock @%s --init --passphrase-stdin` to initialize it", n, n)
+		}
+		dataKey, err = initializeEncryptedDB(db, passphrase)
+		if err != nil {
+			return err
+		}
+		initialized = true
+	}
+	if err := saveSession(n, dataKey, sessionTTL); err != nil {
+		return err
+	}
+	fmt.Printf("unlocked @%s\ninitialized: %t\nsession_ttl: %s\n", n, initialized, effectiveSessionTTL(sessionTTL))
+	return nil
+}
+
+func initializeEncryptedDB(db *badger.DB, passphrase string) ([]byte, error) {
+	envelope, dataKey, err := newKeyEnvelope(passphrase)
+	if err != nil {
+		return nil, err
+	}
+	envelopeBts, err := marshalEnvelope(envelope)
+	if err != nil {
+		return nil, err
+	}
+	if err := wrap(db, false, func(tx *badger.Txn) error {
+		if err := tx.Set([]byte(envelopeKey), envelopeBts); err != nil {
+			return fmt.Errorf("write key envelope: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return dataKey, nil
+}
+
+func lock(_ *cobra.Command, args []string) error {
+	n, err := dbNameFromOptionalArg(args)
+	if err != nil {
+		return err
+	}
+	if err := removeSession(n); err != nil {
+		return err
+	}
+	fmt.Printf("locked @%s\n", n)
+	return nil
+}
+
+func status(_ *cobra.Command, args []string) error {
+	n, err := dbNameFromOptionalArg(args)
+	if err != nil {
+		return err
+	}
+	db, err := openKV(n)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+	_, encrypted, err := readEnvelope(db)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("database: @%s\nencrypted: %t\nsession: %s\n", n, encrypted, sessionStatus(n))
+	return nil
+}
+
+func encryptDB(cmd *cobra.Command, args []string) error {
+	n, err := dbNameFromOptionalArg(args)
+	if err != nil {
+		return err
+	}
+	db, err := openKV(n)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+	if _, ok, err := readEnvelope(db); err != nil || ok {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("database @%s is already encrypted", n)
+	}
+	values, err := plaintextValues(db)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		fmt.Printf("database: @%s\nkeys_to_encrypt: %d\n", n, len(values))
+		return nil
+	}
+	passphrase, err := passphraseFromCommand(cmd)
+	if err != nil {
+		return err
+	}
+	envelope, dataKey, err := newKeyEnvelope(passphrase)
+	if err != nil {
+		return err
+	}
+	envelopeBts, err := marshalEnvelope(envelope)
+	if err != nil {
+		return err
+	}
+	if err := wrap(db, false, func(tx *badger.Txn) error {
+		if err := tx.Set([]byte(envelopeKey), envelopeBts); err != nil {
+			return fmt.Errorf("write key envelope: %w", err)
+		}
+		for key, value := range values {
+			encrypted, err := encryptValue(dataKey, value)
+			if err != nil {
+				return err
+			}
+			if err := tx.Set([]byte(key), encrypted); err != nil {
+				return fmt.Errorf("write encrypted value: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := saveSession(n, dataKey, sessionTTL); err != nil {
+		return err
+	}
+	fmt.Printf("encrypted @%s\nkeys_encrypted: %d\nsession_ttl: %s\n", n, len(values), effectiveSessionTTL(sessionTTL))
+	return nil
+}
+
 // getFilePath: get the file path to the skate databases.
 //
 //nolint:wrapcheck
 func getFilePath(args ...string) (string, error) {
-	scope := gap.NewScope(gap.User, "charm")
-	dd, pathErr := scope.DataPath("")
-	if pathErr != nil {
-		return "", pathErr
+	var dd string
+	if dir := os.Getenv("SKATE_DATA_DIR"); dir != "" {
+		dd = dir
+	} else {
+		scope := gap.NewScope(gap.User, "charm")
+		dataPath, pathErr := scope.DataPath("")
+		if pathErr != nil {
+			return "", pathErr
+		}
+		dd = filepath.Join(dataPath, "kv")
 	}
-	dir := filepath.Join(dd, "kv")
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := os.MkdirAll(dd, 0o750); err != nil {
 		return "", err
 	}
-	return filepath.Join(append([]string{dir}, args...)...), nil
+	return filepath.Join(append([]string{dd}, args...)...), nil
 }
 
 // deleteDb: delete a Skate database.
@@ -246,6 +474,17 @@ func deleteDb(_ *cobra.Command, args []string) error {
 	}
 	message := fmt.Sprintf("Are you sure you want to delete '%s' and all its contents? (y/n)", warningStyle.Render(showpath))
 	message = lipgloss.NewStyle().Width(78).Render(message)
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "Would delete %q\n", showpath)
+		return nil
+	}
+	if assumeYes {
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "Deleted %q\n", showpath)
+		return nil
+	}
 	fmt.Println(message)
 
 	// TODO: use huh
@@ -295,7 +534,7 @@ func findDb(name string) (string, error) {
 }
 
 //nolint:wrapcheck
-func list(_ *cobra.Command, args []string) error {
+func list(cmd *cobra.Command, args []string) error {
 	var k string
 	var pf string
 	if keysIterate || valuesIterate {
@@ -314,7 +553,13 @@ func list(_ *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	n = normalizeDBName(n)
 	db, err := openKV(n)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+	dataKey, err := dataKeyForDB(cmd, db, n)
 	if err != nil {
 		return err
 	}
@@ -334,15 +579,22 @@ func list(_ *cobra.Command, args []string) error {
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			k := item.Key()
+			if isInternalKey(k) {
+				continue
+			}
 			if keysIterate {
 				printFromKV(pf, k)
 				continue
 			}
 			err := item.Value(func(v []byte) error {
+				plaintext, err := decryptValue(dataKey, v)
+				if err != nil {
+					return err
+				}
 				if valuesIterate {
-					printFromKV(pf, v)
+					printFromKV(pf, plaintext)
 				} else {
-					printFromKV(pf, k, v)
+					printFromKV(pf, k, plaintext)
 				}
 				return nil
 			})
@@ -363,6 +615,152 @@ func nameFromArgs(args []string) (string, error) {
 		return "", err
 	}
 	return n, nil
+}
+
+func dbNameFromOptionalArg(args []string) (string, error) {
+	n, err := nameFromArgs(args)
+	if err != nil {
+		return "", err
+	}
+	return normalizeDBName(n), nil
+}
+
+func normalizeDBName(name string) string {
+	if name == "" {
+		return "default"
+	}
+	return name
+}
+
+func dataKeyForDB(_ *cobra.Command, db *badger.DB, dbName string) ([]byte, error) {
+	envelope, ok, err := readEnvelope(db)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("database @%s is not encrypted; run `skate unlock @%s --init --passphrase-stdin` for a new database or `skate encrypt @%s --passphrase-stdin` for an existing plaintext database", dbName, dbName, dbName)
+	}
+	dataKey, err := loadSession(dbName)
+	if err == nil {
+		return dataKey, nil
+	}
+	passphrase := os.Getenv("SKATE_PASSPHRASE")
+	if passphrase == "" && passphraseEnv != "" {
+		passphrase = os.Getenv(passphraseEnv)
+	}
+	if passphrase == "" {
+		return nil, err
+	}
+	dataKey, err = unlockDataKey(envelope, passphrase)
+	if err != nil {
+		return nil, err
+	}
+	if err := saveSession(dbName, dataKey, sessionTTL); err != nil {
+		return nil, err
+	}
+	return dataKey, nil
+}
+
+func readEnvelope(db *badger.DB) (keyEnvelope, bool, error) {
+	var envelopeBts []byte
+	err := wrap(db, true, func(tx *badger.Txn) error {
+		item, err := tx.Get([]byte(envelopeKey))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return errEncryptedDBNotInitialized
+		}
+		if err != nil {
+			return fmt.Errorf("read key envelope: %w", err)
+		}
+		envelopeBts, err = item.ValueCopy(nil)
+		if err != nil {
+			return fmt.Errorf("copy key envelope: %w", err)
+		}
+		return nil
+	})
+	if errors.Is(err, errEncryptedDBNotInitialized) {
+		return keyEnvelope{}, false, nil
+	}
+	if err != nil {
+		return keyEnvelope{}, false, err
+	}
+	envelope, err := unmarshalEnvelope(envelopeBts)
+	if err != nil {
+		return keyEnvelope{}, false, err
+	}
+	return envelope, true, nil
+}
+
+func plaintextValues(db *badger.DB) (map[string][]byte, error) {
+	values := make(map[string][]byte)
+	err := db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.KeyCopy(nil)
+			if isInternalKey(key) {
+				continue
+			}
+			value, err := item.ValueCopy(nil)
+			if err != nil {
+				return fmt.Errorf("copy plaintext value: %w", err)
+			}
+			values[string(key)] = value
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read plaintext values: %w", err)
+	}
+	return values, nil
+}
+
+func isInternalKey(key []byte) bool {
+	return string(key) == envelopeKey
+}
+
+func passphraseFromCommand(cmd *cobra.Command) (string, error) {
+	if passphraseEnv != "" {
+		passphrase := os.Getenv(passphraseEnv)
+		if passphrase == "" {
+			return "", fmt.Errorf("environment variable %s is empty; set it or use --passphrase-stdin", passphraseEnv)
+		}
+		return passphrase, nil
+	}
+	if passphrase := os.Getenv("SKATE_PASSPHRASE"); passphrase != "" {
+		return passphrase, nil
+	}
+	if passphraseStdin {
+		passphrase, err := readSecret(cmd.InOrStdin())
+		if err != nil {
+			return "", err
+		}
+		if passphrase == "" {
+			return "", fmt.Errorf("empty passphrase; provide one with `printf 'secret\\n' | skate unlock @default --passphrase-stdin`")
+		}
+		return passphrase, nil
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", fmt.Errorf("no passphrase provided; use --passphrase-stdin, --passphrase-env NAME, or SKATE_PASSPHRASE")
+	}
+	fmt.Fprint(os.Stderr, "Passphrase: ")
+	bts, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", fmt.Errorf("read passphrase: %w", err)
+	}
+	passphrase := strings.TrimRight(string(bts), "\r\n")
+	if passphrase == "" {
+		return "", fmt.Errorf("empty passphrase")
+	}
+	return passphrase, nil
+}
+
+func effectiveSessionTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return defaultSessionTTL
+	}
+	return ttl
 }
 
 func printFromKV(pf string, vs ...[]byte) {
@@ -409,12 +807,20 @@ func openKV(name string) (*badger.DB, error) {
 }
 
 func init() {
+	rootCmd.PersistentFlags().StringVar(&passphraseEnv, "passphrase-env", "", "environment variable containing the database passphrase")
+	rootCmd.PersistentFlags().DurationVar(&sessionTTL, "session-ttl", defaultSessionTTL, "how long an unlock session remains valid")
 	listCmd.Flags().BoolVarP(&reverseIterate, "reverse", "r", false, "list in reverse lexicographic order")
 	listCmd.Flags().BoolVarP(&keysIterate, "keys-only", "k", false, "only print keys and don't fetch values from the db")
 	listCmd.Flags().BoolVarP(&valuesIterate, "values-only", "v", false, "only print values")
 	listCmd.Flags().StringVarP(&delimiterIterate, "delimiter", "d", "\t", "delimiter to separate keys and values")
 	listCmd.Flags().BoolVarP(&showBinary, "show-binary", "b", false, "print binary values")
 	getCmd.Flags().BoolVarP(&showBinary, "show-binary", "b", false, "print binary values")
+	deleteDbCmd.Flags().BoolVar(&assumeYes, "yes", false, "delete without prompting")
+	deleteDbCmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be deleted")
+	unlockCmd.Flags().BoolVar(&initEncryptedDB, "init", false, "initialize the encrypted database if needed")
+	unlockCmd.Flags().BoolVar(&passphraseStdin, "passphrase-stdin", false, "read the passphrase from stdin")
+	encryptCmd.Flags().BoolVar(&passphraseStdin, "passphrase-stdin", false, "read the passphrase from stdin")
+	encryptCmd.Flags().BoolVar(&dryRun, "dry-run", false, "show how many keys would be encrypted")
 
 	rootCmd.AddCommand(
 		getCmd,
@@ -423,6 +829,10 @@ func init() {
 		listCmd,
 		listDbsCmd,
 		deleteDbCmd,
+		unlockCmd,
+		lockCmd,
+		statusCmd,
+		encryptCmd,
 	)
 }
 
